@@ -1,0 +1,1 @@
+trl transformers torch sentence-transformers faiss-cpu
