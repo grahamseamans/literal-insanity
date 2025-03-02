@@ -1,4 +1,3 @@
-ssh -o StrictHostKeyChecking=no -p 11114 root@sshm.jarvislabs.ai
 
 alright lets try this I guess
 

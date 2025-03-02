@@ -1,1 +1,8 @@
-trl transformers torch sentence-transformers faiss-cpu
+torch
+transformers
+trl
+numpy
+faiss-cpu
+sentence-transformers
+tiktoken
+protobuf

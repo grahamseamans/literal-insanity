@@ -1,20 +1,21 @@
 import faiss
 import numpy as np
-from vllm import LLM
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from sentence_transformers import SentenceTransformer
 import json
-import torch
-from transformers import AutoTokenizer
-from trl import PPOTrainer, PPOConfig
-from trl.core import LengthSampler
+import torch.nn.functional as F
 
 # Initialize model, tokenizer, memory
-model = LLM("agentica/deepscaler-1.5b-preview")
-tokenizer = AutoTokenizer.from_pretrained("agentica/deepscaler-1.5b-preview")
+model = AutoModelForCausalLM.from_pretrained(
+    "agentica-org/DeepScaleR-1.5B-Preview"
+).cuda()
+tokenizer = AutoTokenizer.from_pretrained("agentica-org/DeepScaleR-1.5B-Preview")
 embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
 dimension = 384
 memory_bank = faiss.IndexFlatL2(dimension)
 memory_texts = []
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-6)  # Reduced learning rate
 
 # Lengths
 X_input = 6500
@@ -34,27 +35,7 @@ partitions_output = {
 
 # Load GSM8K dataset (subset: first 100 problems)
 with open("gsm8k_train.json", "r") as f:
-    dataset = json.load(f)[:100]  # Small subset
-
-# PPO Config (GRPO-like)
-ppo_config = PPOConfig(
-    model_name="agentica/deepscaler-1.5b-preview",
-    learning_rate=1e-5,
-    ppo_epochs=4,
-    mini_batch_size=4,
-    batch_size=16,
-    clip_eps=0.2,  # Clipping for stability
-    kl_penalty="kl",  # GRPO typically uses KL penalty
-    target_kl=0.01,  # Target KL divergence
-)
-
-# PPO Trainer (mock GRPO by customizing PPO)
-ppo_trainer = PPOTrainer(
-    config=ppo_config,
-    model=model,
-    ref_model=None,  # Could use original model as reference
-    tokenizer=tokenizer,
-)
+    dataset = json.load(f)[:100]
 
 
 # Helpers
@@ -68,7 +49,32 @@ def extract_tag(text, tag):
     return ""
 
 
+# Memory management settings
+MAX_MEMORY_SIZE = 100
+MEMORY_PRUNE_THRESHOLD = 80
+
+
 def add_to_memory(text, tag):
+    # Check if memory needs pruning
+    if len(memory_texts) >= MEMORY_PRUNE_THRESHOLD:
+        # Remove oldest entries except tutorial
+        to_remove = []
+        for i, mem in enumerate(memory_texts):
+            if mem["tag"] != "tutorial":
+                to_remove.append(i)
+                if len(memory_texts) - len(to_remove) <= MAX_MEMORY_SIZE:
+                    break
+
+        # Remove from FAISS index and memory_texts
+        if to_remove:
+            memory_bank.remove_ids(np.array(to_remove))
+            for i in reversed(to_remove):
+                memory_texts.pop(i)
+            print(
+                f"Pruned {len(to_remove)} memories. Current size: {len(memory_texts)}"
+            )
+
+    # Add new memory
     embedding = embedding_model.encode([text])[0]
     memory_bank.add(np.array([embedding]))
     memory_texts.append({"text": text, "tag": tag})
@@ -79,16 +85,27 @@ def search_memory(query, max_tokens=1000):
     distances, indices = memory_bank.search(np.array([query_embedding]), k=1)
     if indices[0][0] >= 0:
         memory = memory_texts[indices[0][0]]["text"]
+        print(f"Memory found (distance={distances[0][0]:.3f}): {memory[:50]}...")
         return memory[:max_tokens]
+    print("No relevant memory found")
     return "No memory queried"
 
 
 # Seed memory
 add_to_memory("Tutorial: Break into steps, query memory, write insights", "tutorial")
 
+# PPO settings
+clip_eps = 0.2
+batch_size = 2  # Reduced batch size
+max_steps = 5  # Reduced max steps
+max_grad_norm = 1.0  # For gradient clipping
+
+# Enable gradient checkpointing
+model.gradient_checkpointing_enable()
+
 # Training loop
 num_episodes = len(dataset)
-output_length_sampler = LengthSampler(X_output, X_output + 1)  # Fixed output length
+rollouts = []
 for episode in range(num_episodes):
     problem_data = dataset[episode]
     problem_text = f"Problem: {problem_data['question']}"
@@ -110,60 +127,101 @@ for episode in range(num_episodes):
     add_to_memory(problem_text, "current_problem")
 
     # Solve loop
-    max_steps = 10
-    format_penalties = []
     step_rewards = []
     for step in range(max_steps):
-        # Step 1: Encode prompt and generate
-        input_ids = tokenizer.encode(prompt, return_tensors="pt").to(
-            torch.device("cuda")
-        )
-        outputs = model.generate(
-            input_ids=input_ids, max_tokens=X_output, temperature=0, num_beams=1
-        )
-        output = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        # Forward pass with structured decoding
+        torch.cuda.empty_cache()  # Clear cache before forward pass
+        input_ids = tokenizer.encode(prompt, return_tensors="pt").cuda()
+        with torch.amp.autocast(device_type="cuda"):  # Updated autocast syntax
+            outputs = model(input_ids, return_dict=True)
+            logits = outputs.logits[:, -X_output:]  # Predict X_output tokens
+            probs = F.softmax(logits, dim=-1)
+            output_ids = torch.argmax(probs, dim=-1)  # Greedy decode
+            output = tokenizer.decode(output_ids[0], skip_special_tokens=True)
 
-        # Step 2: Post-NN-Call Processing
-        sections = {
-            "thought": extract_tag(output, "thought"),
-            "memory_query": extract_tag(output, "memory_query"),
-            "write_to_memory": extract_tag(output, "write_to_memory"),
-            "answer": extract_tag(output, "answer"),
-        }
+            # Compute log probabilities for PPO
+            log_probs = F.log_softmax(logits, dim=-1)
+            chosen_log_probs = log_probs.gather(
+                dim=-1, index=output_ids.unsqueeze(-1)
+            ).squeeze(-1)
 
-        # Check format compliance
+        # Process output
+        sections = {}
+        current_pos = 0
+        for tag, (start, end) in partitions_output.items():
+            # Get logits for this section
+            section_length = end - start
+            section_text = output[current_pos : current_pos + section_length]
+            sections[tag] = section_text.strip()
+            current_pos += section_length
+
+        # Format sections with tags
+        output = (
+            f"<thought>{sections['thought']}</thought>"
+            f"<memory_query>{sections['memory_query']}</memory_query>"
+            f"<write_to_memory>{sections['write_to_memory']}</write_to_memory>"
+            f"<answer>{sections['answer']}</answer>"
+        )
+
+        # Compute format penalty based on token counts
         format_penalty = 0
         for tag, content in sections.items():
             start, end = partitions_output[tag]
-            if len(content) > (end - start):
-                format_penalty -= 0.5
-        format_penalties.append(format_penalty)
+            token_count = len(tokenizer.encode(content))
+            if token_count > (end - start):
+                format_penalty -= 1.0  # Stronger penalty for token overflow
 
-        # Memory query
+        # Memory query with reward
         memory_query = sections["memory_query"]
+        memory_reward = 0
         if memory_query.strip():
+            print(f"\nStep {step + 1} Memory Query: {memory_query}")
             memory_answer = search_memory(memory_query)
+            # Increased reward for memory usage
+            if memory_answer != "No memory queried":
+                memory_reward = 0.3  # Increased from 0.2
+                print(f"Memory reward: {memory_reward}")
         else:
             memory_answer = "No memory queried"
+            memory_reward = -0.1  # Penalty for not using memory
+            print("No memory query made")
 
-        # Write to memory
+        # Write to memory with penalty for redundancy
         write_content = sections["write_to_memory"]
+        memory_write_penalty = 0
         if write_content.strip():
+            print(f"\nAttempting to write to memory: {write_content[:50]}...")
+            # Check for redundant writes
+            if write_content in [m["text"] for m in memory_texts]:
+                memory_write_penalty = -0.2  # Increased penalty for redundancy
+                print("Redundant memory write detected")
+            else:
+                memory_write_penalty = 0.1  # Reward for unique memory writes
             add_to_memory(write_content, f"step_{step}_ep_{episode}")
+            print(f"Memory write penalty: {memory_write_penalty}")
 
-        # Check answer
+        # Reward calculation
         answer = sections["answer"]
         reward = 0
         if answer.strip():
             is_correct = str(answer) == str(correct_answer)
-            reward = 1 if is_correct else 0
+            reward = 1 if is_correct else -0.2  # Added penalty for wrong answers
             print(
-                f"Episode {episode + 1}, Step {step + 1}: Answer: {answer}, Correct: {is_correct} (Expected: {correct_answer})"
+                f"Episode {episode + 1}, Step {step + 1}: Answer: {answer}, Correct: {is_correct}"
             )
             if is_correct:
-                print(f"Solved in {step + 1} steps!")
+                # Extra reward if memory helped
+                if memory_answer != "No memory queried":
+                    reward += 0.5  # Increased from 0.3
                 break
-        reward += format_penalty - 0.1  # Per-step penalty
+
+        # Combine all rewards
+        reward += (
+            format_penalty  # Format compliance
+            + memory_reward  # Memory query reward
+            + memory_write_penalty  # Memory write penalty
+            - 0.1  # Step penalty
+        )
         step_rewards.append(reward)
 
         # Update prompt
@@ -183,21 +241,151 @@ for episode in range(num_episodes):
             * (6500 - 5500 - len(f"<memory_answer>{memory_answer}</memory_answer>"))
         )
 
-    # Final reward for episode
+    # Collect rollout
     total_reward = sum(step_rewards)
-    episode_rollout = {
-        "query": tokenizer.encode(prompt, return_tensors="pt"),
-        "response": output,
-        "reward": total_reward,
-    }
+    query_ids = tokenizer.encode(prompt, return_tensors="pt").cuda()
+    response_ids = output_ids.clone()  # Use the generated output IDs
 
-    # GRPO training (batch rollouts)
-    ppo_trainer.step(
-        query=episode_rollout["query"],
-        response=tokenizer.encode(output, return_tensors="pt"),
-        reward=torch.tensor([total_reward]),
-    )
+    # Store log probabilities instead of logits
+    rollouts.append((query_ids, response_ids, chosen_log_probs, total_reward))
     print(f"Episode {episode + 1}: Total Reward = {total_reward}")
 
-# Final log
+    # PPO training every batch_size episodes
+    if (episode + 1) % batch_size == 0:
+        # Unpack rollouts
+        queries, responses, old_log_probs, rewards = zip(*rollouts)
+
+        # Find max lengths
+        max_query_len = max(q.size(1) for q in queries)
+        max_response_len = max(r.size(1) for r in responses)
+
+        # Pad sequences
+        padded_queries = torch.zeros(
+            len(queries), max_query_len, dtype=torch.long, device="cuda"
+        )
+        padded_responses = torch.zeros(
+            len(responses), max_response_len, dtype=torch.long, device="cuda"
+        )
+        padded_old_log_probs = torch.zeros(
+            len(old_log_probs), max_response_len, device="cuda"
+        )
+
+        # Pad sequences
+        for i, (q, r, olp) in enumerate(zip(queries, responses, old_log_probs)):
+            padded_queries[i, : q.size(1)] = q[0]
+            padded_responses[i, : r.size(1)] = r[0]
+            padded_old_log_probs[i, : olp.size(1)] = olp[0]
+
+        rewards = torch.tensor(rewards, device="cuda")
+
+        # Forward pass for new log probs
+        torch.cuda.empty_cache()
+        with torch.amp.autocast(device_type="cuda"):
+            outputs = model(padded_queries)
+            new_logits = outputs.logits[:, -X_output:]
+            new_log_probs = (
+                F.log_softmax(new_logits, dim=-1)
+                .gather(dim=-1, index=padded_responses.unsqueeze(-1))
+                .squeeze(-1)
+            )
+
+        # Debug info
+        print(
+            f"New log probs: {new_log_probs.mean().item()}, Old log probs: {padded_old_log_probs.mean().item()}"
+        )
+
+        # Compute mask for valid tokens
+        response_mask = (padded_responses != 0).float()
+
+        # Compute PPO loss
+        advantages = rewards.unsqueeze(-1).expand_as(new_log_probs) - rewards.mean()
+        ratio = torch.exp(new_log_probs - padded_old_log_probs)
+
+        # Debug ratio statistics
+        print(
+            f"Ratio mean: {ratio.mean().item()}, min: {ratio.min().item()}, max: {ratio.max().item()}"
+        )
+
+        surr1 = ratio * advantages
+        surr2 = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * advantages
+        policy_loss = -torch.min(surr1, surr2) * response_mask
+        policy_loss = (
+            policy_loss.sum() / response_mask.sum()
+        )  # Average over valid tokens
+
+        # Update with gradient clipping
+        optimizer.zero_grad()
+        policy_loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+        optimizer.step()
+        rollouts = []  # Clear batch
+        print(f"Batch {episode // batch_size + 1}: Policy Loss = {policy_loss.item()}")
+
+# Final training on remaining rollouts
+if rollouts:
+    # Unpack rollouts
+    queries, responses, old_log_probs, rewards = zip(*rollouts)
+
+    # Find max lengths
+    max_query_len = max(q.size(1) for q in queries)
+    max_response_len = max(r.size(1) for r in responses)
+
+    # Pad sequences
+    padded_queries = torch.zeros(
+        len(queries), max_query_len, dtype=torch.long, device="cuda"
+    )
+    padded_responses = torch.zeros(
+        len(responses), max_response_len, dtype=torch.long, device="cuda"
+    )
+    padded_old_log_probs = torch.zeros(
+        len(old_log_probs), max_response_len, device="cuda"
+    )
+
+    for i, (q, r, olp) in enumerate(zip(queries, responses, old_log_probs)):
+        padded_queries[i, : q.size(1)] = q[0]
+        padded_responses[i, : r.size(1)] = r[0]
+        padded_old_log_probs[i, : olp.size(1)] = olp[0]
+
+    rewards = torch.tensor(rewards, device="cuda")
+
+    # Forward pass for new log probs
+    torch.cuda.empty_cache()
+    with torch.amp.autocast(device_type="cuda"):
+        outputs = model(padded_queries)
+        new_logits = outputs.logits[:, -X_output:]
+        new_log_probs = (
+            F.log_softmax(new_logits, dim=-1)
+            .gather(dim=-1, index=padded_responses.unsqueeze(-1))
+            .squeeze(-1)
+        )
+
+    # Debug info
+    print(
+        f"Final batch - New log probs: {new_log_probs.mean().item()}, Old log probs: {padded_old_log_probs.mean().item()}"
+    )
+
+    # Compute mask for valid tokens
+    response_mask = (padded_responses != 0).float()
+
+    # Compute PPO loss
+    advantages = rewards.unsqueeze(-1).expand_as(new_log_probs) - rewards.mean()
+    ratio = torch.exp(new_log_probs - padded_old_log_probs)
+
+    # Debug ratio statistics
+    print(
+        f"Final batch - Ratio mean: {ratio.mean().item()}, min: {ratio.min().item()}, max: {ratio.max().item()}"
+    )
+
+    surr1 = ratio * advantages
+    surr2 = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * advantages
+    policy_loss = -torch.min(surr1, surr2) * response_mask
+    policy_loss = policy_loss.sum() / response_mask.sum()  # Average over valid tokens
+
+    # Update with gradient clipping
+    optimizer.zero_grad()
+    policy_loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+    optimizer.step()
+    print(f"Final Batch: Policy Loss = {policy_loss.item()}")
+
 print("Training completed")
