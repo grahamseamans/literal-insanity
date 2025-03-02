@@ -1,5 +1,5 @@
 #!/bin/bash
-
+# ssh -p 1123 root@195.242.10.170
 # Set variables
 REMOTE_USER="root"
 REMOTE_HOST="195.242.10.170"
