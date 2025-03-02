@@ -20,25 +20,11 @@ start_time = time.time()
 quant_config = BitsAndBytesConfig(
     load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16, bnb_4bit_quant_type="nf4"
 )
-try:
-    print("Attempting to load model...")
-    model = AutoModelForCausalLM.from_pretrained(
-        "agentica-org/DeepScaleR-1.5B-Preview",
-        quantization_config=quant_config,
-        device_map="auto",
-    )
-    print(f"Model loaded successfully, type: {type(model)}")
-    if model is None:
-        raise RuntimeError("Model is None after loading")
-
-    print("Verifying model state...")
-    print(f"Model has parameters: {hasattr(model, 'parameters')}")
-    for name, param in model.named_parameters():
-        print(f"Parameter {name} is on device: {param.device}")
-        break  # Just print the first one as an example
-except Exception as e:
-    print(f"Error loading model: {str(e)}")
-    raise
+model = AutoModelForCausalLM.from_pretrained(
+    "agentica-org/DeepScaleR-1.5B-Preview",
+    quantization_config=quant_config,
+    device_map="auto",
+)
 tokenizer = AutoTokenizer.from_pretrained("agentica-org/DeepScaleR-1.5B-Preview")
 print(f"GPU Memory Allocated After Load: {torch.cuda.memory_allocated() / 1e9:.2f} GiB")
 print(f"GPU Memory Reserved After Load: {torch.cuda.memory_reserved() / 1e9:.2f} GiB")
@@ -52,7 +38,7 @@ optimizer = torch.optim.Adam(model.parameters(), lr=1e-6)
 
 # Input and output sizes
 X_input = 4096  # ~4k tokens for context window
-X_output = 512  # Generate ~512 tokens per thought node
+X_output = 1020  # Match your run’s setting
 max_steps = 5
 clip_eps = 0.2
 batch_size = 2
@@ -159,41 +145,51 @@ def generate_until_thought(prompt, max_new_tokens, tokenizer):
     input_ids = tokenizer.encode(prompt, return_tensors="pt").to(model.device)
     generated_ids = input_ids.clone()
     generated_text = prompt
+    log_probs_list = []
 
     chunk_size = 128
     tokens_generated = 0
     while tokens_generated < max_new_tokens:
         tokens_to_generate = min(chunk_size, max_new_tokens - tokens_generated)
-        for _ in range(tokens_to_generate):
-            with torch.amp.autocast(device_type="cuda"):
-                outputs = model(generated_ids)
-                next_token_logits = outputs.logits[:, -1, :]
-                probs = F.softmax(next_token_logits, dim=-1)
-                next_token = torch.argmax(probs, dim=-1)
-                generated_ids = torch.cat(
-                    (generated_ids, next_token.unsqueeze(-1)), dim=-1
-                )
-                log_probs = (
-                    F.log_softmax(next_token_logits, dim=-1)
-                    .gather(dim=-1, index=next_token.unsqueeze(-1))
-                    .squeeze(-1)
-                )
-                next_token_text = tokenizer.decode(next_token, skip_special_tokens=True)
-                generated_text += next_token_text
+        with torch.amp.autocast(device_type="cuda"):
+            outputs = model(generated_ids)
+            next_logits = outputs.logits[:, -1:, :]
+            probs = F.softmax(next_logits, dim=-1)
+            next_token = torch.argmax(probs, dim=-1)
+            next_log_prob = F.log_softmax(next_logits, dim=-1)
 
-                tokens_generated += 1
-                if "</thought>" in generated_text[-10:]:
-                    print(f"Completed thought node after {tokens_generated} tokens")
-                    return generated_text, generated_ids, log_probs
-        del outputs, next_token_logits, probs, next_token
+            # Store full log probabilities for each token
+            log_probs_list.append(
+                next_log_prob.squeeze(1)  # Remove batch dimension for storage
+            )
+
+            generated_ids = torch.cat((generated_ids, next_token), dim=-1)
+            generated_text += tokenizer.decode(next_token[0], skip_special_tokens=True)
+            tokens_generated += 1
+            if "</thought>" in generated_text[-10:]:
+                print(f"Completed thought node after {tokens_generated} tokens")
+                break
         torch.cuda.empty_cache()
 
-    print(f"Reached max tokens ({max_new_tokens}) without completing thought node")
-    return generated_text, generated_ids, log_probs
+    if tokens_generated >= max_new_tokens:
+        print(f"Reached max tokens ({max_new_tokens}) without completing thought node")
+
+    # Stack log probabilities into a single tensor
+    log_probs_tensor = (
+        torch.stack(log_probs_list, dim=0)
+        if log_probs_list
+        else torch.tensor([], device=model.device)
+    )
+    print(f"Generated {tokens_generated} tokens")
+    print(f"Log probs tensor shape: {log_probs_tensor.shape}")
+    print(
+        f"Log probs min/max: {log_probs_tensor.min().item():.3f}/{log_probs_tensor.max().item():.3f}"
+    )
+    return generated_text, generated_ids, log_probs_tensor
 
 
 # Grade a thought node and compute reward
-def grade_thought_node(node, correct_answer, tokenizer):
+def grade_thought_node(node, correct_answer, tokenizer, prompt_length):
     sections = {
         "last_memory_response": extract_tag(node, "last_memory_response") or "",
         "working_memory": extract_tag(node, "working_memory") or "",
@@ -203,15 +199,22 @@ def grade_thought_node(node, correct_answer, tokenizer):
     }
 
     reward = 0
-    format_score = 1.0 if all(sections[tag] for tag in sections) else -1.0
+    # Strong incentive for completing thoughts
+    format_score = 3.0 if "</thought>" in node else -1.0  # Increased to +3.0
 
+    # Penalty based on current thought length (exclude prompt)
+    current_thought = node[len("<thought>") :] if "<thought>" in node else node
+    thought_tokens = len(tokenizer.encode(current_thought)) - prompt_length
     size_penalty = 0.0
-    thought_tokens = len(tokenizer.encode(node))
     if thought_tokens > 1000:
-        size_penalty -= 0.5
+        excess_tokens = thought_tokens - 1000
+        size_penalty = -0.1 * (excess_tokens / 500)  # -0.1 per 500 tokens over 1k
+        size_penalty = max(size_penalty, -1.0)  # Cap at -1.0
         print(
-            f"Size penalty for thought node: {thought_tokens} tokens exceed preferred 1000"
+            f"Size penalty for current thought: {thought_tokens} tokens, penalty: {size_penalty:.2f}"
         )
+    else:
+        print(f"Current thought length: {thought_tokens} tokens (no penalty)")
 
     answer = sections["answer"]
     correctness_score = 0
@@ -247,7 +250,7 @@ for episode in tqdm(range(num_episodes), desc="Training Episodes"):
     memory_answer = "No memory queried"
     initial_prompt = trim_context(problem_text, thought_history, X_input, tokenizer)
     thought_history.append(
-        f"<thought><last_memory_response>{memory_answer}</last_memory_response><working_memory>Let’s solve this step-by-step...</working_memory><memory_request>What’s the first step?</memory_request><write_to_memory>Starting reasoning...</write_to_memory><answer>Not sure yet</answer></thought>"
+        f"<thought><last_memory_response>{memory_answer}</last_memory_response><working_memory>Let’s solve this concisely and end with </thought>...<memory_request>What’s the first step?</memory_request><write_to_memory>Starting...</write_to_memory><answer>Not sure yet</answer></thought>"
     )
 
     episode_rewards = []
@@ -266,8 +269,9 @@ for episode in tqdm(range(num_episodes), desc="Training Episodes"):
 
         # Generate until thought completes
         seed = "<thought>"
+        prompt_length = len(tokenizer.encode(current_prompt + seed))
         generated_text, generated_ids, log_probs = generate_until_thought(
-            current_prompt + seed, X_output - len(tokenizer.encode(seed)), tokenizer
+            current_prompt + seed, X_output - prompt_length, tokenizer
         )
 
         # Extract and process the latest thought node
@@ -279,14 +283,16 @@ for episode in tqdm(range(num_episodes), desc="Training Episodes"):
             latest_node = "<thought><last_memory_response>No memory queried</last_memory_response><working_memory>Incomplete</working_memory><memory_request>?</memory_request><write_to_memory>?</write_to_memory><answer>?</answer></thought>"
 
         # Grade the thought node
-        reward, sections = grade_thought_node(latest_node, correct_answer, tokenizer)
+        reward, sections = grade_thought_node(
+            latest_node, correct_answer, tokenizer, prompt_length
+        )
         episode_rewards.append(reward)
         queries.append(
             tokenizer.encode(current_prompt + seed, return_tensors="pt")[0].to(
                 model.device
             )
         )
-        responses.append(generated_ids[0])
+        responses.append(generated_ids[0][-X_output:])
         log_probs_list.append(log_probs)
 
         # Memory lookup and update prompt
@@ -322,12 +328,17 @@ for episode in tqdm(range(num_episodes), desc="Training Episodes"):
             print("Correct answer found, stopping episode")
             break
 
-    # Custom PPO update
-    print("Starting PPO update...")
-    start_ppo_time = time.time()
-    max_query_len = max(q.size(0) for q in queries)
-    max_response_len = max(r.size(0) for r in responses)
+    # Custom PPO update with debug prints
+    print("\n=== Starting PPO Update ===")
+    print(f"Number of steps: {len(queries)}")
+    print(f"Episode rewards: {episode_rewards}")
 
+    # Calculate max lengths and create padded tensors
+    max_query_len = max(q.size(0) for q in queries)
+    max_response_len = X_output
+    print(f"Max query length: {max_query_len}, Max response length: {max_response_len}")
+
+    # Initialize padded tensors
     padded_queries = torch.zeros(
         len(queries), max_query_len, dtype=torch.long, device=model.device
     )
@@ -335,28 +346,56 @@ for episode in tqdm(range(num_episodes), desc="Training Episodes"):
         len(responses), max_response_len, dtype=torch.long, device=model.device
     )
     padded_old_log_probs = torch.zeros(
-        len(log_probs_list), max_response_len, dtype=torch.float32, device=model.device
+        len(responses), max_response_len, dtype=torch.float32, device=model.device
     )
 
+    # Pad sequences with detailed debugging
     for i, (q, r, olp) in enumerate(zip(queries, responses, log_probs_list)):
+        print(f"\n=== Processing step {i + 1} ===")
+        print(f"Query tensor: shape={q.shape}, device={q.device}")
+        print(f"Response tensor: shape={r.shape}, device={r.device}")
+        print(f"Log probs tensor: shape={olp.shape}, device={olp.device}")
+
+        # Pad queries
         padded_queries[i, : q.size(0)] = q
-        padded_responses[i, : r.size(0)] = r
-        padded_old_log_probs[i, : min(olp.size(0), max_response_len)] = olp[
-            : min(olp.size(0), max_response_len)
-        ]
+        print(f"Padded query shape: {padded_queries[i].shape}")
+
+        # Pad responses
+        response_length = min(r.size(0), max_response_len)
+        padded_responses[i, :response_length] = r[:response_length]
+        print(f"Padded response shape: {padded_responses[i].shape}")
+
+        # Handle log probabilities
+        if olp.size(0) > 0:
+            # Get token-level log probs for the response
+            response_log_probs = olp[:response_length]  # Take only what we need
+            padded_old_log_probs[i, :response_length] = response_log_probs.gather(
+                1, r[:response_length].unsqueeze(-1)
+            ).squeeze(-1)
+            print(f"Response log probs shape: {response_log_probs.shape}")
+            print(f"Padded log probs shape: {padded_old_log_probs[i].shape}")
+            print(
+                f"Log probs min/max: {padded_old_log_probs[i].min().item():.3f}/{padded_old_log_probs[i].max().item():.3f}"
+            )
 
     rewards = torch.tensor(episode_rewards, device=model.device)
     torch.cuda.empty_cache()
 
     with torch.amp.autocast(device_type="cuda"):
         outputs = model(padded_queries)
-        new_logits = outputs.logits[:, -X_output:]
+        new_logits = outputs.logits[:, -max_response_len:, :]
+        print(
+            f"New logits shape: {new_logits.shape}, Padded responses shape: {padded_responses.shape}"
+        )
         new_log_probs = (
             F.log_softmax(new_logits, dim=-1)
             .gather(dim=-1, index=padded_responses.unsqueeze(-1))
             .squeeze(-1)
         )
 
+    print(
+        f"New log probs shape: {new_log_probs.shape}, Old log probs shape: {padded_old_log_probs.shape}"
+    )
     print(
         f"New log probs: {new_log_probs.mean().item()}, Old log probs: {padded_old_log_probs.mean().item()}"
     )

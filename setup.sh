@@ -7,7 +7,7 @@ HOME_DIR="/home"
 VENV_DIR="${HOME_DIR}/venv"
 SSH_CMD="ssh -p ${REMOTE_PORT} ${REMOTE_USER}@${REMOTE_HOST}"
 
-echo "=== Starting Deployment and Training Process ==="
+echo "=== Starting Setup Process ==="
 
 # Function to run command on remote and check status
 run_remote() {
@@ -18,7 +18,7 @@ run_remote() {
 echo "Step 1: Setting up remote environment..."
 run_remote "mkdir -p ${REMOTE_DIR} ${HOME_DIR} && \
     apt-get update && \
-    apt-get install -y rsync python3-dev"  # Add python3-dev here
+    apt-get install -y rsync python3-dev"
 
 echo "Step 2: Syncing project files..."
 rsync -avz -e "ssh -p ${REMOTE_PORT}" \
@@ -68,7 +68,4 @@ print(\"Dataset converted successfully!\")
         echo 'Dataset already exists, skipping download.'
     fi"
 
-echo "Step 6: Starting training..."
-run_remote "cd ${REMOTE_DIR} && source ${VENV_DIR}/bin/activate && python3 train.py"
-
-echo "=== Process Complete ==="
+echo "=== Setup Complete ==="
