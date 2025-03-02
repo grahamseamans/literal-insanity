@@ -9,3 +9,4 @@ protobuf
 outlines
 accelerate
 sentencepiece
+bitsandbytes>=0.43.3
